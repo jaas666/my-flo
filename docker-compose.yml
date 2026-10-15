@@ -1,0 +1,15 @@
+services:
+  esphome:
+    build:
+      context: .devcontainer
+      args:
+        UID: ${UID:-1000}
+        GID: ${GID:-1000}
+    command: sleep infinity
+    working_dir: /workspace/esphome
+    volumes:
+      - .:/workspace
+      - esphome-cache:/home/dev/.cache/esphome
+
+volumes:
+  esphome-cache:

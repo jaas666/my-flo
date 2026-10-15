@@ -1,0 +1,485 @@
+# iFLO dispenser -> ESPHome (core local function). DRAFT, NOT YET TESTED ON HARDWARE.
+#
+# Pin assignments are for PCB rev 6.3 (see the repo wiki, "Hardware GPIO Map"). Anything marked
+# TODO(unconfirmed) is a guess to verify at the device.
+#
+# STANDALONE FIRST: the unit must keep working with Home Assistant (and even WiFi) down. So:
+# the schedule, clock (SNTP), dose limits, counters and failsafe all live on the device and are
+# persisted to flash; the physical button / web UI work locally; ESPHome's default "reboot if no
+# API client/WiFi" timers are disabled. HA is an optional controller and history/monitoring
+# front end, not a dependency. Clock caveat: without a time source after a power loss the clock
+# is invalid and scheduled doses are skipped until SNTP (or HA) sets it again.
+#
+# NOT in this build: deep sleep/wake, valve position feedback/retry, missed-dose catch-up.
+# Planned wake design for battery use: timer (from the on-device schedule), front button GPIO6
+# (ext1, all-low), bottle eject GPIO13 (ext0, wake on the opposite of the current level). The float
+# switch GPIO7 and external power GPIO16 need a ULP program or timer polling. Deep sleep leaves
+# GPIO9/10 unheld, so the board must keep the valve driver inputs low while asleep: check that
+# at the device before enabling sleep.
+# Always-on WiFi drains the battery quickly: bench/USB power only for now.
+#
+# SAFETY: the hardware comes in two valve variants (simple on/off, and a latching motor valve
+# with feedback that needs a reverse pulse), identified by three strap pins GPIO18/19/20
+# (value = g18 + 2*g19 + 4*g20): 0 -> simple valve, 7 -> latching valve. This config implements
+# only the simple valve (GPIO10 high = open, both low = closed) and REFUSES to open the valve
+# unless all three strap pins read low. Still unverified on hardware: bench-test first with a
+# current-limited ~3V supply.
+
+substitutions:
+  name: iflo-dispenser
+  # Valve-open time per dose, in seconds. Pick your own; the right value for your bottle is
+  # unverified.
+  dose_time_default: "3.0"
+  # Hard cap on how long the valve can ever stay open, regardless of any other logic.
+  max_open_s: "30"
+  # Battery voltage = ADC pin voltage * battery_divider. 3.02 is the divider ratio used for this
+  # board; confirm by measuring the battery and the BAT_ADC pad with a multimeter.
+  battery_divider: "3.02"
+  # Battery range (mV) and thresholds (%); dispensing is blocked below bat_low_pct.
+  bat_min_mv: "2200"
+  bat_max_mv: "3000"
+  bat_low_pct: "20"
+  bat_crit_pct: "10"
+  # TODO(unconfirmed): timezone (set from the build machine's UTC-5 offset in October).
+  timezone: "America/Chicago"
+  # NTP server reachable without HA; use your router/LAN NTP if the unit has no internet.
+  ntp_server: "pool.ntp.org"
+  # Gap between consecutive scheduled doses.
+  dose_gap_s: "2"
+
+esphome:
+  name: ${name}
+  friendly_name: iFLO Dispenser
+
+esp32:
+  variant: esp32s2
+  board: esp32-s2-saola-1
+  flash_size: 4MB
+  framework:
+    type: esp-idf
+
+logger:
+  # UART0 (the JP1 pads). Keeps the USB pins GPIO19/20 free for the strap inputs.
+  hardware_uart: UART0
+
+api:
+  # Default is to reboot after 15 min with no API client; that would reboot-loop whenever HA is
+  # down. 0s disables it so the unit just keeps running its own schedule.
+  reboot_timeout: 0s
+  encryption:
+    key: !secret api_key
+
+ota:
+  - platform: esphome
+    encryption: {}
+
+wifi:
+  ssid: !secret wifi_ssid
+  password: !secret wifi_password
+  # Same reasoning as api: never reboot just because the network is gone.
+  reboot_timeout: 0s
+  ap:
+    ssid: ${name}-fallback
+    password: !secret ap_password
+
+# Local control and status page that works with no HA and no cloud.
+web_server:
+  port: 80
+  auth:
+    type: digest
+    username: admin
+    password: !secret web_password
+
+time:
+  # Primary clock: independent of HA. HA also sets the clock when connected.
+  - platform: sntp
+    id: sys_time
+    timezone: ${timezone}
+    servers:
+      - ${ntp_server}
+  - platform: homeassistant
+    id: ha_time
+
+globals:
+  - id: used_dose_cnt
+    type: int
+    restore_value: true
+    initial_value: "0"
+  - id: last_dispense_epoch
+    type: uint32_t
+    restore_value: true
+    initial_value: "0"
+  # Doses queued by the on-device schedule, run one at a time by run_pending.
+  - id: pending_doses
+    type: int
+    restore_value: false
+    initial_value: "0"
+  # Day-of-year each schedule slot last fired (guards against double-firing within a day).
+  - id: sched_day1
+    type: int
+    initial_value: "-1"
+  - id: sched_day2
+    type: int
+    initial_value: "-1"
+  - id: sched_day3
+    type: int
+    initial_value: "-1"
+  - id: sched_day4
+    type: int
+    initial_value: "-1"
+
+output:
+  # Valve driver pins (confirmed).
+  - platform: gpio
+    pin: GPIO9
+    id: valve_a
+  - platform: gpio
+    pin: GPIO10
+    id: valve_b
+
+script:
+  # Interlocked drive. Open = A low, B high. Closed = both low. Never both high.
+  - id: valve_open
+    then:
+      - if:
+          condition:
+            lambda: "return id(hw_id0).state || id(hw_id1).state || id(hw_id2).state;"
+          then:
+            - logger.log:
+                level: ERROR
+                format: "Refusing to open valve: hardware strap pins GPIO18/19/20 are not all low (not the simple-valve model)"
+            - script.stop: valve_open
+      - output.turn_off: valve_a
+      - output.turn_on: valve_b
+      - script.execute: valve_failsafe
+  - id: valve_close
+    then:
+      - script.stop: valve_failsafe
+      - output.turn_off: valve_b
+      - output.turn_off: valve_a
+  - id: valve_failsafe
+    mode: restart
+    then:
+      - delay: ${max_open_s}s
+      - logger.log:
+          level: WARN
+          format: "Valve failsafe timeout hit, forcing close"
+      - script.execute: valve_close
+  - id: dispense
+    mode: single
+    then:
+      - if:
+          condition:
+            lambda: |-
+              if (id(hw_id0).state || id(hw_id1).state || id(hw_id2).state) {
+                ESP_LOGW("dispense", "Blocked: hardware strap pins GPIO18/19/20 are not all low");
+                return true;
+              }
+              float pct = id(battery_pct).state;
+              if (!std::isnan(pct) && pct < ${bat_low_pct}) {
+                ESP_LOGW("dispense", "Blocked: battery %.0f%% below ${bat_low_pct}%%", pct);
+                return true;
+              }
+              int limit = (int) id(max_doses).state;
+              if (limit > 0 && id(used_dose_cnt) >= limit) {
+                ESP_LOGW("dispense", "Blocked: used %d of max %d doses", id(used_dose_cnt), limit);
+                return true;
+              }
+              return false;
+          then:
+            - script.stop: dispense
+      - script.execute: valve_open
+      - delay: !lambda "return id(dose_time).state * 1000;"
+      - script.execute: valve_close
+      - lambda: |-
+          id(used_dose_cnt) += 1;
+          id(used_dose_cnt_sensor).publish_state(id(used_dose_cnt));
+          auto now = id(sys_time).now();
+          if (now.is_valid()) {
+            id(last_dispense_epoch) = now.timestamp;
+            id(last_dispense).publish_state(now.timestamp);
+          }
+
+  # On-device schedule (4 daily slots; 0 doses = slot disabled). Runs with no HA.
+  - id: run_pending
+    mode: single
+    then:
+      - while:
+          condition:
+            lambda: "return id(pending_doses) > 0;"
+          then:
+            - lambda: "id(pending_doses) -= 1;"
+            - script.execute: dispense
+            - script.wait: dispense
+            - delay: ${dose_gap_s}s
+
+interval:
+  - interval: 20s
+    then:
+      - lambda: |-
+          auto now = id(sys_time).now();
+          if (!now.is_valid()) return;
+          if (id(slot1_doses).state > 0 && now.hour == id(slot1_time).hour &&
+              now.minute == id(slot1_time).minute && id(sched_day1) != now.day_of_year) {
+            id(sched_day1) = now.day_of_year;
+            id(pending_doses) += (int) id(slot1_doses).state;
+          }
+          if (id(slot2_doses).state > 0 && now.hour == id(slot2_time).hour &&
+              now.minute == id(slot2_time).minute && id(sched_day2) != now.day_of_year) {
+            id(sched_day2) = now.day_of_year;
+            id(pending_doses) += (int) id(slot2_doses).state;
+          }
+          if (id(slot3_doses).state > 0 && now.hour == id(slot3_time).hour &&
+              now.minute == id(slot3_time).minute && id(sched_day3) != now.day_of_year) {
+            id(sched_day3) = now.day_of_year;
+            id(pending_doses) += (int) id(slot3_doses).state;
+          }
+          if (id(slot4_doses).state > 0 && now.hour == id(slot4_time).hour &&
+              now.minute == id(slot4_time).minute && id(sched_day4) != now.day_of_year) {
+            id(sched_day4) = now.day_of_year;
+            id(pending_doses) += (int) id(slot4_doses).state;
+          }
+      - if:
+          condition:
+            lambda: "return id(pending_doses) > 0;"
+          then:
+            - script.execute: run_pending
+
+switch:
+  - platform: template
+    name: Valve
+    id: valve_switch
+    icon: mdi:valve
+    optimistic: true
+    turn_on_action:
+      - script.execute: valve_open
+    turn_off_action:
+      - script.execute: valve_close
+
+button:
+  - platform: template
+    name: Dispense
+    icon: mdi:water-plus
+    on_press:
+      - script.execute: dispense
+  - platform: template
+    name: Reset dose counter
+    entity_category: config
+    on_press:
+      - lambda: |-
+          id(used_dose_cnt) = 0;
+          id(used_dose_cnt_sensor).publish_state(0);
+
+number:
+  - platform: template
+    name: Dose time
+    id: dose_time
+    entity_category: config
+    unit_of_measurement: s
+    min_value: 0.1
+    max_value: ${max_open_s}
+    step: 0.1
+    initial_value: ${dose_time_default}
+    restore_value: true
+    optimistic: true
+  - platform: template
+    name: Max doses
+    id: max_doses
+    entity_category: config
+    min_value: 0
+    max_value: 10000
+    step: 1
+    initial_value: 0
+    restore_value: true
+    optimistic: true
+  - platform: template
+    name: Schedule 1 doses
+    id: slot1_doses
+    entity_category: config
+    min_value: 0
+    max_value: 10
+    step: 1
+    initial_value: 0
+    restore_value: true
+    optimistic: true
+  - platform: template
+    name: Schedule 2 doses
+    id: slot2_doses
+    entity_category: config
+    min_value: 0
+    max_value: 10
+    step: 1
+    initial_value: 0
+    restore_value: true
+    optimistic: true
+  - platform: template
+    name: Schedule 3 doses
+    id: slot3_doses
+    entity_category: config
+    min_value: 0
+    max_value: 10
+    step: 1
+    initial_value: 0
+    restore_value: true
+    optimistic: true
+  - platform: template
+    name: Schedule 4 doses
+    id: slot4_doses
+    entity_category: config
+    min_value: 0
+    max_value: 10
+    step: 1
+    initial_value: 0
+    restore_value: true
+    optimistic: true
+
+datetime:
+  - platform: template
+    name: Schedule 1 time
+    id: slot1_time
+    type: time
+    entity_category: config
+    initial_value: "08:00:00"
+    restore_value: true
+    optimistic: true
+  - platform: template
+    name: Schedule 2 time
+    id: slot2_time
+    type: time
+    entity_category: config
+    initial_value: "12:00:00"
+    restore_value: true
+    optimistic: true
+  - platform: template
+    name: Schedule 3 time
+    id: slot3_time
+    type: time
+    entity_category: config
+    initial_value: "16:00:00"
+    restore_value: true
+    optimistic: true
+  - platform: template
+    name: Schedule 4 time
+    id: slot4_time
+    type: time
+    entity_category: config
+    initial_value: "20:00:00"
+    restore_value: true
+    optimistic: true
+
+sensor:
+  # Battery on ADC1 channel 7 = GPIO8 (confirmed), 11dB attenuation (confirmed).
+  - platform: adc
+    pin: GPIO8
+    id: battery_adc
+    attenuation: 12db
+    update_interval: 60s
+    internal: true
+    filters:
+      - sliding_window_moving_average:
+          window_size: 5
+          send_every: 1
+  - platform: template
+    name: Battery voltage
+    id: battery_mv
+    device_class: voltage
+    unit_of_measurement: mV
+    accuracy_decimals: 0
+    update_interval: 60s
+    lambda: "return id(battery_adc).state * 1000.0 * ${battery_divider};"
+  - platform: template
+    name: Battery
+    id: battery_pct
+    device_class: battery
+    unit_of_measurement: "%"
+    accuracy_decimals: 0
+    update_interval: 60s
+    lambda: |-
+      float mv = id(battery_mv).state;
+      if (std::isnan(mv)) return NAN;
+      float pct = (mv - ${bat_min_mv}) * 100.0 / (${bat_max_mv} - ${bat_min_mv});
+      return std::max(0.0f, std::min(100.0f, pct));
+  - platform: template
+    name: Doses used
+    id: used_dose_cnt_sensor
+    accuracy_decimals: 0
+    state_class: total_increasing
+    lambda: "return id(used_dose_cnt);"
+  # Persisted across reboots, so HA gets the real last dose time when it reconnects.
+  - platform: template
+    name: Last dispense
+    id: last_dispense
+    device_class: timestamp
+    entity_category: diagnostic
+    update_interval: 60s
+    lambda: "return id(last_dispense_epoch) == 0 ? NAN : (float) id(last_dispense_epoch);"
+
+binary_sensor:
+  # Hardware variant strap pins GPIO18/19/20. Internal pull-ups, so an open (floating) strap
+  # reads high and keeps the valve interlock closed; the board ties them low for the simple
+  # valve. GPIO19/20 are the S2's USB pins.
+  - platform: gpio
+    id: hw_id0
+    name: Hardware ID bit 0 (GPIO18)
+    entity_category: diagnostic
+    pin:
+      number: GPIO18
+      mode: INPUT_PULLUP
+  - platform: gpio
+    id: hw_id1
+    name: Hardware ID bit 1 (GPIO19)
+    entity_category: diagnostic
+    pin:
+      number: GPIO19
+      mode: INPUT_PULLUP
+  - platform: gpio
+    id: hw_id2
+    name: Hardware ID bit 2 (GPIO20)
+    entity_category: diagnostic
+    pin:
+      number: GPIO20
+      mode: INPUT_PULLUP
+  - platform: template
+    name: Battery low
+    device_class: battery
+    lambda: "return id(battery_pct).state < ${bat_low_pct};"
+  - platform: template
+    name: Battery critical
+    device_class: problem
+    lambda: "return id(battery_pct).state < ${bat_crit_pct};"
+  # Front button on GPIO6: internal pull-up, pressed = low. Reports state only: on the factory
+  # unit a press wakes the unit and keeps it awake rather than dispensing, so no dose is
+  # triggered here. Not yet tested on hardware.
+  - platform: gpio
+    pin:
+      number: GPIO6
+      mode: INPUT_PULLUP
+      inverted: true
+    name: Front button
+    id: front_button
+    filters:
+      - delayed_on: 30ms
+  # Bottle eject switch GPIO13 and float switch GPIO7: pull-up inputs, reported raw
+  # (on = pin low). Their meaning is unconfirmed, so they only report state for now.
+  - platform: gpio
+    pin:
+      number: GPIO13
+      mode: INPUT_PULLUP
+      inverted: true
+    name: Bottle eject switch
+    entity_category: diagnostic
+  - platform: gpio
+    pin:
+      number: GPIO7
+      mode: INPUT_PULLUP
+      inverted: true
+    name: Float switch
+    entity_category: diagnostic
+  # External power sense GPIO16: pull-down input, on = pin high.
+  - platform: gpio
+    pin:
+      number: GPIO16
+      mode: INPUT_PULLDOWN
+    name: External power
+    device_class: power
+    entity_category: diagnostic

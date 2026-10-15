@@ -1,0 +1,12 @@
+{
+  "name": "my-flo ESPHome",
+  "dockerComposeFile": ["../docker-compose.yml"],
+  "service": "esphome",
+  "workspaceFolder": "/workspace",
+  "remoteUser": "dev",
+  "customizations": {
+    "vscode": {
+      "extensions": ["esphome.esphome-vscode", "redhat.vscode-yaml"]
+    }
+  }
+}
